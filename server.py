@@ -1,8 +1,9 @@
 """
 MCP server exposing the User Admin `users` table (PostgreSQL) as read-only tools.
 
-Transport: stdio. The NestJS backend starts this script and talks MCP over stdin/stdout,
-so nothing may be printed to stdout except protocol messages (logging goes to stderr).
+Transport: streamable HTTP. Run it yourself in a terminal (`.venv/Scripts/python server.py`);
+the NestJS backend connects to http://MCP_HOST:MCP_PORT/mcp (default http://127.0.0.1:8765/mcp).
+Stateless mode: no session is kept, so this server can be restarted while the backend runs.
 
 Database settings come from environment variables (DB_HOST, DB_PORT, DB_USER, DB_PASSWORD,
 DB_NAME); anything not set is read from ../Nest_Js_Project/.env.
@@ -16,7 +17,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
@@ -104,10 +105,29 @@ USER_COLUMNS = "id, name, email, age, created_at"
 SORTS = {"id": "id ASC", "name": "lower(name) ASC, id ASC", "age": "age ASC NULLS LAST, id ASC", "newest": "created_at DESC, id DESC"}
 
 
-def _search_filter(search: str | None) -> tuple[str, dict]:
-    if not search or not search.strip():
-        return "", {}
-    return "WHERE name ILIKE %(pattern)s OR email ILIKE %(pattern)s", {"pattern": f"%{search.strip()}%"}
+def _parse_date(value: str | None, field: str) -> date | None:
+    if not value or not value.strip():
+        return None
+    try:
+        return date.fromisoformat(value.strip()[:10])
+    except ValueError as err:
+        raise ToolError(f"{field} must be a date like 2026-11-02.") from err
+
+
+def _search_filter(search: str | None, created_from: str | None = None, created_to: str | None = None) -> tuple[str, dict]:
+    """WHERE clause for the optional text search and creation-date range (both dates inclusive)."""
+    conditions: list[str] = []
+    params: dict = {}
+    if search and search.strip():
+        conditions.append("(name ILIKE %(pattern)s OR email ILIKE %(pattern)s)")
+        params["pattern"] = f"%{search.strip()}%"
+    if (start := _parse_date(created_from, "created_from")) is not None:
+        conditions.append("created_at >= %(created_from)s")
+        params["created_from"] = start
+    if (end := _parse_date(created_to, "created_to")) is not None:
+        conditions.append("created_at < %(created_to)s")
+        params["created_to"] = end + timedelta(days=1)
+    return ("WHERE " + " AND ".join(conditions) if conditions else ""), params
 
 
 # ---------- server + tools ----------
@@ -126,18 +146,22 @@ def list_users(
     offset: int = 0,
     search: str | None = None,
     sort: Literal["id", "name", "age", "newest"] = "id",
+    created_from: str | None = None,
+    created_to: str | None = None,
 ) -> UserList:
-    """List users from the database. Use for "show/list all users" or "find users named X".
+    """List users from the database. Use for "show/list all users", "find users named X" or "users created today".
 
     Args:
         limit: How many users to return (1-100, default 20).
         offset: How many users to skip, for paging.
         search: Optional text to match in the name or email (case-insensitive).
         sort: Order: "id", "name", "age" or "newest".
+        created_from: Optional first creation date, YYYY-MM-DD (inclusive). For "created today" use today's date.
+        created_to: Optional last creation date, YYYY-MM-DD (inclusive).
     """
     limit = max(1, min(int(limit), MAX_LIMIT))
     offset = max(0, int(offset))
-    where, params = _search_filter(search)
+    where, params = _search_filter(search, created_from, created_to)
     order = SORTS.get(sort, SORTS["id"])
     total = _query(f"SELECT count(*) AS n FROM users {where}", params)[0]["n"]
     rows = _query(
@@ -162,13 +186,15 @@ def get_user(user_id: int) -> User:
 
 
 @server.tool(title="Count users")
-def count_users(search: str | None = None) -> UserCount:
-    """Count users, optionally only those whose name or email matches `search`.
+def count_users(search: str | None = None, created_from: str | None = None, created_to: str | None = None) -> UserCount:
+    """Count users, optionally only those whose name or email matches `search` or created in a date range.
 
     Args:
         search: Optional text to match in the name or email (case-insensitive).
+        created_from: Optional first creation date, YYYY-MM-DD (inclusive).
+        created_to: Optional last creation date, YYYY-MM-DD (inclusive).
     """
-    where, params = _search_filter(search)
+    where, params = _search_filter(search, created_from, created_to)
     return UserCount(total=_query(f"SELECT count(*) AS n FROM users {where}", params)[0]["n"])
 
 
@@ -192,5 +218,11 @@ def user_stats() -> UserStats:
 
 
 if __name__ == "__main__":
-    log.info("starting (stdio), database %s@%s:%s/%s", DB["user"], DB["host"], DB["port"], DB["dbname"])
-    server.run()
+    host = os.environ.get("MCP_HOST", "127.0.0.1")
+    port = int(os.environ.get("MCP_PORT", "8765"))
+    log.info("database %s@%s:%s/%s", DB["user"], DB["host"], DB["port"], DB["dbname"])
+    log.info("listening on http://%s:%s/mcp", host, port)
+    try:
+        server.run("streamable-http", host=host, port=port, stateless_http=True, json_response=True)
+    except KeyboardInterrupt:
+        log.info("stopped")
